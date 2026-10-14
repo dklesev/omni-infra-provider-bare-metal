@@ -24,6 +24,7 @@ import (
 // Client is a wrapper around the gofish client.
 type Client struct {
 	logger                    *zap.Logger
+	machineID                 string
 	config                    gofish.ClientConfig
 	setBootSourceOverrideMode bool
 }
@@ -158,17 +159,38 @@ func (c *Client) getSystem(client *gofish.APIClient) (*schemas.ComputerSystem, e
 		return nil, err
 	}
 
+	return selectSystem(systems, c.machineID, c.logger)
+}
+
+// selectSystem picks the system to operate on.
+//
+// A Redfish service can expose more than one system, e.g., an enclosure manager or an emulator fronting several machines.
+// In that case, the system whose UUID matches the machine ID is picked: the machine ID is the SMBIOS UUID reported by Talos,
+// and Redfish services are expected to report the SMBIOS UUID in the same format.
+// If no system matches, the first one is used.
+func selectSystem(systems []*schemas.ComputerSystem, machineID string, logger *zap.Logger) (*schemas.ComputerSystem, error) {
 	if len(systems) == 0 {
 		return nil, fmt.Errorf("no systems found")
 	}
 
-	if len(systems) > 1 {
-		ids := xslices.Map(systems, func(system *schemas.ComputerSystem) string {
-			return system.ID
-		})
-
-		c.logger.Warn("multiple systems found, using first one", zap.Strings("system_ids", ids))
+	if len(systems) == 1 {
+		return systems[0], nil
 	}
+
+	if machineID != "" {
+		for _, system := range systems {
+			// Redfish allows upper-case hex digits in UUIDs, Talos reports them in lower case
+			if strings.EqualFold(system.UUID, machineID) {
+				return system, nil
+			}
+		}
+	}
+
+	ids := xslices.Map(systems, func(system *schemas.ComputerSystem) string {
+		return fmt.Sprintf("%s (UUID: %s)", system.ID, system.UUID)
+	})
+
+	logger.Warn("multiple systems found, none matches the machine ID, using first one", zap.String("machine_id", machineID), zap.Strings("systems", ids))
 
 	return systems[0], nil
 }
@@ -224,7 +246,9 @@ func (c *Client) setBootAMIFutureState(client *gofish.APIClient, system *schemas
 }
 
 // NewClient returns a new Redfish BMC client.
-func NewClient(options Options, address, username, password string, logger *zap.Logger) *Client {
+//
+// The machine ID is used to pick the system to operate on when the Redfish service exposes more than one.
+func NewClient(options Options, address, username, password, machineID string, logger *zap.Logger) *Client {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
@@ -246,6 +270,7 @@ func NewClient(options Options, address, username, password string, logger *zap.
 			BasicAuth: true,
 		},
 
+		machineID:                 machineID,
 		setBootSourceOverrideMode: options.SetBootSourceOverrideMode,
 		logger:                    logger,
 	}
